@@ -36,7 +36,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
