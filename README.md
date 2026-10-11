@@ -31,6 +31,20 @@ MoviePilot → 设置 → 基础设置 → **插件市场**，在原有地址后
 > 索引有 30 分钟缓存，没刷出来就重启一次 MoviePilot。
 > 匿名调 GitHub API 每小时只有 60 次配额，装插件报 403 的话给 MP 配一个 `GITHUB_TOKEN`。
 
+### 不走市场的直装方式（市场刷不出来时用）
+
+把仓库 clone 到跑 Docker 的宿主机上，然后：
+
+```bash
+./tools/install.sh              # 自动找 moviepilot 容器
+./tools/install.sh <容器名>
+docker restart <容器名>
+```
+
+脚本做三件事：`docker cp` 插件到容器里的 `/app/app/plugins/gyingbtmagnet`、
+把 `GYingBTMagnet` 写进 `UserInstalledPlugins`、提示重启。
+容器重建（升级镜像）后需要重跑一次。
+
 ---
 
 ## GYingBTMagnet
