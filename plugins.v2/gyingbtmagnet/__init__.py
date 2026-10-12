@@ -39,7 +39,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -282,17 +282,33 @@ class GYingBTMagnet(_PluginBase):
             holder.update(flow.run_collect(page, query))
             return True
 
-        try:
-            PlaywrightHelper().action(
-                url="about:blank",
-                callback=_callback,
-                headless=True,
-                timeout=self._timeout,
-            )
-        except Exception as err:
-            logger.error(f"[GYingBTMagnet] 浏览器流程异常：{err}")
+        def _work():
+            try:
+                PlaywrightHelper().action(
+                    url="about:blank",
+                    callback=_callback,
+                    headless=True,
+                    timeout=self._timeout,
+                )
+            except Exception as err:
+                logger.error(f"[GYingBTMagnet] 浏览器流程异常：{err}")
 
-        if not holder or not holder.get("candidates"):
+        # 开始标记：便于区分「命令没跑」与「跑了但浏览器卡住」
+        self.save_data("run_start", f"{time.strftime('%Y-%m-%d %H:%M:%S')} {query}")
+
+        # 看门狗：CloakBrowser 偶发卡死时也要让搜索有结果返回（否则一直不落盘）
+        worker = threading.Thread(target=_work, daemon=True)
+        worker.start()
+        worker.join(timeout=240)
+        timed_out = worker.is_alive()
+
+        if timed_out:
+            holder.setdefault("success", False)
+            holder.setdefault("candidates", [])
+            holder.setdefault("trace", [])
+            holder["trace"].append("浏览器流程超时（>240s 未返回），镜像站可能响应慢或人机校验未过")
+            holder["message"] = "浏览器流程超时（>240s）：镜像站响应慢或人机校验未通过"
+        elif not holder or not holder.get("candidates"):
             holder.setdefault("success", False)
             holder.setdefault("candidates", [])
             if not holder:

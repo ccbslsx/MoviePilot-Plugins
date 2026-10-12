@@ -89,9 +89,18 @@ class BTRpaFlow:
 
         collected: List[Dict[str, Any]] = []
         seen_href: set = set()
+        started_ts = time.time()
+        early_stop = 10   # 候选够多就不再跑满所有镜像，控制总时长
+        budget = 180      # 秒；超过则提前收手
 
         # 2. 逐个镜像尝试，收集候选（不取磁力、不下载）
         for idx, mirror in enumerate(mirrors[: self._max_sites], 1):
+            if len(collected) >= early_stop:
+                note("候选已足够，提前结束镜像遍历")
+                break
+            if time.time() - started_ts > budget:
+                note("已超过时间预算，提前结束镜像遍历")
+                break
             url = mirror["href"]
             note(f"[{idx}/{min(len(mirrors), self._max_sites)}] 尝试 {url}")
             try:
