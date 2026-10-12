@@ -25,10 +25,8 @@ MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9A-Za-z]{32,40}[^\s\"'<>]*", re
 CHALLENGE_HINTS = ("正在计算", "安全验证", "验证中", "Checking your browser", "Just a moment")
 # 镜像站挂掉的提示语
 BROKEN_HINTS = ("502 Bad Gateway", "503 Service", "504 Gateway", "Bad Gateway", "服务暂时不可用")
-# 导航站自身「全挂」的提示语（页面标题常为「挂了👻」）
-DEAD_HINTS = ("挂了", "无法访问", "请更换", "部分节点", "节点无法访问", "没有可用", "全部失联")
-# 未登录的提示语
-LOGGED_OUT_HINTS = ("立即登录", "请先登录", "登录后")
+# 未登录 / 登录墙的提示语
+LOGGED_OUT_HINTS = ("立即登录", "请先登录", "登录后", "受限内容", "请登录后继续", "未登录", "登录后访问")
 # 登录按钮候选
 LOGIN_BUTTON_HINTS = ("立即登录", "登录", "登陆", "Sign in", "Login")
 # 提交按钮候选
@@ -81,11 +79,6 @@ class BTRpaFlow:
         time.sleep(2)
         self._wait_for_body(page)  # SPA 首屏常是空壳，等正文渲染
         self._dismiss_overlays(page)
-        body0 = self._body(page)
-        if any(h in body0 for h in DEAD_HINTS):
-            result["message"] = "导航站当前所有镜像不可达（页面显示「挂了/请更换」），稍后再试"
-            note(result["message"])
-            return result
         mirrors = self._collect_mirrors(page)
         result["mirrors"] = len(mirrors)
         if not mirrors:
@@ -110,6 +103,7 @@ class BTRpaFlow:
             self._wait_for_challenge(page)
             self._dismiss_overlays(page)
             body = self._body(page)
+            note(f"  标题={self._title(page)!r} 正文={body[:60]!r}")
             if self._is_broken(body):
                 note("  镜像异常（502/空页），换下一个")
                 continue
@@ -172,6 +166,8 @@ class BTRpaFlow:
             # domcontentloaded 超时也继续，后面靠 body 内容判断
             pass
         self._wait_idle(page)
+        # 镜像站每次导航都可能弹 JS 人机校验，统一在这里等它过去
+        self._wait_for_challenge(page)
 
     @staticmethod
     def _wait_idle(page):
@@ -208,13 +204,20 @@ class BTRpaFlow:
         )
         time.sleep(0.6)
 
-    def _wait_for_challenge(self, page, rounds: int = 10):
+    def _wait_for_challenge(self, page, rounds: int = 15):
         """等 JS 人机校验跑完（CloakBrowser 一般能自动过）。"""
         for _ in range(rounds):
             body = self._body(page)
             if body and not any(h in body for h in CHALLENGE_HINTS):
                 return
             time.sleep(2)
+
+    @staticmethod
+    def _title(page) -> str:
+        try:
+            return (page.title() or "").strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _is_broken(body: str) -> bool:
@@ -281,7 +284,22 @@ class BTRpaFlow:
             logger.warn("[GYingBTMagnet] 未配置站点账号密码，跳过登录")
             return False
 
-        # 打开登录弹窗
+        # 打开登录页/登录弹窗
+        if not self._has_visible(page, 'input[type="password"]'):
+            # 站点常见固定登录路径，直接跳转最稳（当前站点为 /user/login）
+            try:
+                cur = getattr(page, "url", "") or ""
+            except Exception:
+                cur = ""
+            base = re.match(r"https?://[^/]+", cur) if cur else None
+            if base:
+                for path in ("/user/login", "/login"):
+                    try:
+                        self._goto(page, base.group(0) + path)
+                    except Exception:
+                        continue
+                    if self._has_visible(page, 'input[type="password"]'):
+                        break
         if not self._has_visible(page, 'input[type="password"]'):
             for kw in LOGIN_BUTTON_HINTS:
                 if self._click_by_text(page, kw):
@@ -332,12 +350,20 @@ class BTRpaFlow:
             logger.warn("[GYingBTMagnet] 没找到密码输入框")
             return False
 
-        # 提交
+        # 提交：优先用稳定的提交按钮选择器，其次文本匹配，最后表单 submit()
         submitted = False
-        for kw in SUBMIT_BUTTON_HINTS:
-            if self._click_by_text(page, kw):
+        for sel in ('button[type="submit"]', '#button', 'button.btn-primary', 'input[type="submit"]'):
+            try:
+                page.click(sel, timeout=5000)
                 submitted = True
                 break
+            except Exception:
+                continue
+        if not submitted:
+            for kw in SUBMIT_BUTTON_HINTS:
+                if self._click_by_text(page, kw):
+                    submitted = True
+                    break
         if not submitted:
             self._js(
                 page,
@@ -397,6 +423,17 @@ class BTRpaFlow:
             self._goto(page, search_url)
         except Exception:
             pass
+
+        # 搜索页可能仍要求登录（第一次进站未提示时）→ 就地登录后重搜
+        sbody = self._body(page)
+        if self._need_login(page, sbody) and self._username and self._password:
+            note("  搜索页要求登录，就地登录后重搜")
+            if self._login(page):
+                note("  登录完成，重新搜索")
+                try:
+                    self._goto(page, search_url)
+                except Exception:
+                    pass
 
         links = self._collect_bt_links(page)
         if not links:
