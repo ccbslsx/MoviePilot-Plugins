@@ -28,7 +28,9 @@ class GYingBTMagnetSearchInput(BaseModel):
         True,
         description=(
             "是否把选出的磁力直接提交到下载器，默认 true。"
-            "用户说「先看看」「只搜不下载」「有哪些资源」时传 false。"
+            "用户说「先看看」「只搜不下载」「有哪些资源」「先别下载」「看看有哪些」时传 false。"
+            "注意：工具内部会自动识别 query 里的这些标记词并强制只搜不下，"
+            "正常调用时保持默认 true 即可，无需手动处理。"
         ),
     )
 
@@ -52,6 +54,13 @@ class GYingBTMagnetSearchTool(MoviePilotTool):
         query = kwargs.get("query", "")
         return f"磁力搜索中：{query}"
 
+    # 与插件命令解析共用同一套「只搜不下」关键词，保证 /bt 和智能体工具行为一致
+    NO_ADD_KEYWORDS = (
+        "先别下载", "先不要下载", "不要下载", "不下载", "别下载", "暂不下载",
+        "只搜", "只搜索", "只搜不下", "只查", "先看看", "看看有哪些", "不下",
+        "先搜一下", "先搜", "不落盘", "不加下载", "不提交",
+    )
+
     async def run(self, query: str, add: bool = True, **kwargs) -> str:
         plugin = PluginManager().running_plugins.get("GYingBTMagnet")
         if not plugin:
@@ -59,8 +68,17 @@ class GYingBTMagnetSearchTool(MoviePilotTool):
         if not plugin.get_state():
             return "磁力搜索插件未启用，请到插件页打开开关并保存。"
 
-        rpa, download = await self.run_blocking("web", plugin.run_search, query, add)
-        return plugin.format_report(query, rpa, download)
+        # 自然语言兜底：query 里带「只搜/先别下载」等标记时强制只搜不下载，
+        # 不依赖上层是否把 add 置为 False。同时把标记词从搜索词里剥掉。
+        cleaned = query or ""
+        for kw in self.NO_ADD_KEYWORDS:
+            if kw in cleaned:
+                add = False
+                cleaned = cleaned.replace(kw, "")
+        cleaned = cleaned.strip(" ，,。.、")
+
+        rpa, download = await self.run_blocking("web", plugin.run_search, cleaned, add)
+        return plugin.format_report(cleaned, rpa, download, add=add)
 
 
 def get_tools() -> List[Type[MoviePilotTool]]:

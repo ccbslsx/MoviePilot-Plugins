@@ -3,11 +3,12 @@
     "name": "GYing 磁力导航搜索下载",
     "description": "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器入库；支持远程命令 /bt、插件 API 与智能体工具。",
     "labels": "搜索,下载",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png",
     "author": "ccbslsx",
     "level": 1,
     "history": {
+      "v1.2.0": "新增「只搜不下」模式：/bt 或智能体工具在片名里带「先别下载 / 只搜 / 不下 / 先看看」等标记时只返回候选磁力、不提交下载；报告明确标注查看/已下载",
       "v1.1.0": "智能体工具描述改为中文并列出触发词，「磁力搜索 / 磁力找一下 / BT找一下 / BT搜索一下」都能命中",
       "v1.0.0": "首个版本：导航站镜像遍历、自动登录、做种数优选、落下载器，附带 /bt 远程命令、插件 API 与智能体工具"
     }

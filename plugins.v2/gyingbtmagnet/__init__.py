@@ -36,7 +36,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -100,11 +100,36 @@ class GYingBTMagnet(_PluginBase):
             {
                 "cmd": "/bt",
                 "event": EventType.PluginAction,
-                "desc": "磁力搜索下载",
+                "desc": "磁力搜索下载（加「只搜/先别下载/不下」只搜不下载）",
                 "category": "媒体搜索",
                 "data": {"action": "gyingbtmagnet_search"},
             }
         ]
+
+    # 识别「只搜不下」意图的关键词：命中则不提交下载器
+    NO_ADD_KEYWORDS = (
+        "先别下载", "先不要下载", "不要下载", "不下载", "别下载", "暂不下载",
+        "只搜", "只搜索", "只搜不下", "只查", "先看看", "看看有哪些", "不下",
+        "先搜一下", "先搜", "不落盘", "不加下载", "不提交",
+    )
+
+    @classmethod
+    def parse_query(cls, arg_str: str) -> Tuple[str, bool]:
+        """
+        把 /bt 的参数拆成 (片名, 是否提交下载)。
+
+        命中 NO_ADD_KEYWORDS 中任意片段就只搜不下载；
+        同时把这些标记词从片名里剥掉，避免污染搜索词。
+        """
+        raw = (arg_str or "").strip()
+        add = True
+        query = raw
+        for kw in cls.NO_ADD_KEYWORDS:
+            if kw in query:
+                add = False
+                query = query.replace(kw, "")
+        query = query.strip(" ，,。.、")
+        return query, add
 
     @eventmanager.register(EventType.PluginAction)
     def command_handler(self, event: Event):
@@ -117,13 +142,23 @@ class GYingBTMagnet(_PluginBase):
         channel = event_data.get("channel")
         source = event_data.get("source")
         userid = event_data.get("user")
-        query = (event_data.get("arg_str") or "").strip()
+        arg_str = (event_data.get("arg_str") or "").strip()
 
+        if not arg_str:
+            self.post_message(
+                channel=channel,
+                title="【磁力搜索】",
+                text="用法：/bt 片名\n例如：/bt 盗梦空间\n想只看候选不下载：/bt 兰香如故 先别下载",
+                userid=userid,
+            )
+            return
+
+        query, add = self.parse_query(arg_str)
         if not query:
             self.post_message(
                 channel=channel,
                 title="【磁力搜索】",
-                text="用法：/bt 片名\n例如：/bt 盗梦空间",
+                text="没识别到片名。用法：/bt 片名（例如 /bt 兰香如故 先别下载）",
                 userid=userid,
             )
             return
@@ -131,13 +166,13 @@ class GYingBTMagnet(_PluginBase):
         # 浏览器流程可能要跑一两分钟，扔到后台线程，别占着事件消费线程
         threading.Thread(
             target=self._search_and_notify,
-            args=(query, channel, userid),
+            args=(query, channel, userid, add),
             daemon=True,
         ).start()
 
-    def _search_and_notify(self, query: str, channel, userid):
+    def _search_and_notify(self, query: str, channel, userid, add: bool = None):
         try:
-            rpa, download = self.run_search(query)
+            rpa, download = self.run_search(query, add)
         except Exception as err:
             logger.error(f"[GYingBTMagnet] 搜索异常：{err}")
             self.post_message(
@@ -150,7 +185,7 @@ class GYingBTMagnet(_PluginBase):
         self.post_message(
             channel=channel,
             title=f"【磁力搜索】{query}",
-            text=self.format_report(query, rpa, download),
+            text=self.format_report(query, rpa, download, add=add),
             userid=userid,
         )
 
@@ -264,7 +299,8 @@ class GYingBTMagnet(_PluginBase):
 
     # ------------------------------------------------------------ 结果整理
     @staticmethod
-    def format_report(query: str, rpa: Dict[str, Any], download: Dict[str, Any]) -> str:
+    def format_report(query: str, rpa: Dict[str, Any], download: Dict[str, Any],
+                      add: bool = True) -> str:
         lines: List[str] = []
         if rpa.get("success"):
             lines.append(f"✅ 命中：{rpa.get('title') or query}")
@@ -273,8 +309,13 @@ class GYingBTMagnet(_PluginBase):
             lines.append(f"⏱ 耗时：{rpa.get('elapsed', '-')}s")
             if download.get("success"):
                 lines.append(f"⬇️ {download.get('message')}（{download.get('downloader')}）")
+                lines.append(f"磁力：{rpa.get('magnet')}")
             else:
-                lines.append(f"⚠️ {download.get('message')}")
+                # 未提交下载：可能是「只搜不下」，也可能是落盘失败
+                if not add:
+                    lines.append("👀 仅查看候选，未提交下载（按你的要求）")
+                else:
+                    lines.append(f"⚠️ {download.get('message')}")
                 lines.append(f"磁力：{rpa.get('magnet')}")
         else:
             lines.append(f"❌ 没有搜到可用磁力：{rpa.get('message')}")
