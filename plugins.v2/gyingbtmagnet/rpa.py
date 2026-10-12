@@ -51,6 +51,8 @@ class BTRpaFlow:
         self._min_seeds = max(0, int(min_seeds or 0))
         self._max_sites = max(1, int(max_sites or 6))
         self._page_timeout = max(5, int(page_timeout or 30)) * 1000
+        # 取磁力等单步动作的过程记录，供插件落盘排查（run_collect 用自己的 note）
+        self.notes: List[str] = []
 
     # ------------------------------------------------------------------ 对外
     def run_collect(self, page, query: str) -> Dict[str, Any]:
@@ -165,7 +167,15 @@ class BTRpaFlow:
 
     # 公开包装：针对已确定的详情页链接取磁力（供下载步骤复用浏览器上下文）
     def fetch_magnet(self, page, mirror: str, href: str) -> Optional[str]:
-        return self._fetch_magnet(page, mirror, href)
+        self.notes.append(f"进入详情页 {mirror.rstrip('/')}{href}")
+        magnet = self._fetch_magnet(page, mirror, href)
+        self.notes.append("✓ 取到磁力" if magnet else "✗ 未取到磁力")
+        return magnet
+
+    def _note(self, msg: str):
+        """记录取磁力过程（同时进插件 data 和 MP 日志）。"""
+        self.notes.append(msg)
+        logger.info(f"[GYingBTMagnet] {msg}")
 
     # ------------------------------------------------------------ 基础动作
     def _goto(self, page, url: str):
@@ -541,15 +551,18 @@ class BTRpaFlow:
         except Exception:
             body = ""
         if self._need_login(page, body):
-            logger.info("[GYingBTMagnet] 详情页需要登录，先登录再回跳")
+            self._note(f"详情页需要登录（正文片段 {body[:40]!r}），先登录再回跳")
             if not self._login(page):
-                logger.warn("[GYingBTMagnet] 取磁力前登录失败")
+                self._note("登录失败，取磁力中止")
                 return None
+            self._note("登录完成，回跳详情页")
             try:
                 self._goto(page, target)
             except Exception:
                 return None
             time.sleep(2)
+        else:
+            self._note("详情页无需登录")
 
         for _ in range(8):
             mags = self._js(
@@ -561,6 +574,7 @@ class BTRpaFlow:
                 [],
             ) or []
             if mags:
+                self._note("解析到磁力链接")
                 return mags[0].split("\n")[0].strip()
 
             # 兜底：整页正则
@@ -571,7 +585,9 @@ class BTRpaFlow:
                 pass
             m = MAGNET_RE.search(html)
             if m:
+                self._note("整页正则兜底命中磁力")
                 return m.group(0).strip()
 
             time.sleep(1.5)
+        self._note("8 轮重试内都没解析到磁力链接")
         return None

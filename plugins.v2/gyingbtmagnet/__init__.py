@@ -39,7 +39,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -252,10 +252,27 @@ class GYingBTMagnet(_PluginBase):
                 "message": f"编号超出范围（列表共 {len(candidates)} 个），用 /bt 下载第N个 重选",
             }
         cand = candidates[index - 1]
+        self.save_data("run_download_start", f"{time.strftime('%Y-%m-%d %H:%M:%S')} 第{index}个 "
+                                           f"{(cand.get('text') or '')[:60]}")
         magnet = self.fetch_single_magnet(cand.get("site"), cand.get("href"))
         if not magnet:
+            self.save_data("last_download", {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "index": index,
+                "title": cand.get("text"),
+                "ok": False,
+                "message": "取磁力失败（详情页没解析到磁力链接）",
+            })
             return {"success": False, "message": "取磁力失败（详情页没解析到磁力链接）", "candidate": cand}
         download = self.add_to_downloader(magnet)
+        self.save_data("last_download", {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "index": index,
+            "title": cand.get("text"),
+            "ok": bool(download.get("success")),
+            "message": download.get("message"),
+            "downloader": download.get("downloader"),
+        })
         self._record_history(
             self.get_data("last_query") or cand.get("text", ""),
             {"title": cand.get("text"), "seeds": cand.get("seeds"), "site": cand.get("site")},
@@ -341,7 +358,7 @@ class GYingBTMagnet(_PluginBase):
             max_sites=self._max_sites,
             page_timeout=self._timeout,
         )
-        holder: Dict[str, Any] = {"magnet": None}
+        holder: Dict[str, Any] = {"magnet": None, "trace": []}
 
         def _callback(page):
             holder["magnet"] = flow.fetch_magnet(page, site or "", href or "")
@@ -354,8 +371,14 @@ class GYingBTMagnet(_PluginBase):
                 headless=True,
                 timeout=self._timeout,
             )
+            holder["trace"].append("浏览器回调已正常返回")
         except Exception as err:
             logger.error(f"[GYingBTMagnet] 取磁力浏览器流程异常：{err}")
+            holder["trace"].append(f"浏览器流程抛异常：{err}")
+        # 把流程内部的步骤记录一并落盘（v1.3.5），
+        # 以后「下载第N个」出问题直接读插件 data 的 last_download_trace，不用翻日志
+        holder["trace"] = list(flow.notes) + holder["trace"]
+        self.save_data("last_download_trace", holder["trace"])
         return holder.get("magnet")
 
     def add_to_downloader(self, magnet: str) -> Dict[str, Any]:
