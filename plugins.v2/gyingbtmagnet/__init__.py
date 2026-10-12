@@ -39,7 +39,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -295,12 +295,22 @@ class GYingBTMagnet(_PluginBase):
         if not holder or not holder.get("candidates"):
             holder.setdefault("success", False)
             holder.setdefault("candidates", [])
-            holder.setdefault(
-                "message",
-                holder.get("message") or "没有搜到可用磁力（导航站/镜像可能临时不可用或需登录）",
-            )
+            if not holder:
+                # PlaywrightHelper.action 返回 None：说明 CloakBrowser 初始化/导航失败，
+                # 异常被 action 外层吞掉了，这里给出明确提示，避免静默空结果
+                holder["message"] = (
+                    "浏览器未返回任何页面（CloakBrowser 可能未就绪或站点到不了），"
+                    "请查看 MoviePilot 日志里的 [GYingBTMagnet] / CloakBrowser 报错"
+                )
+            else:
+                holder["message"] = holder.get("message") or "没有搜到可用磁力（导航站/镜像当前可能不可用）"
         else:
             holder["success"] = True
+
+        # 无论成败都把过程 trace 落盘，便于从插件 data 直接看卡在哪一步
+        self.save_data("last_trace", holder.get("trace") or [])
+        self.save_data("last_query", query)
+        self.save_data("last_time", time.strftime("%Y-%m-%d %H:%M:%S"))
         return holder
 
     def fetch_single_magnet(self, site: str, href: str) -> Optional[str]:

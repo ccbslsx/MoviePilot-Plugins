@@ -25,6 +25,8 @@ MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9A-Za-z]{32,40}[^\s\"'<>]*", re
 CHALLENGE_HINTS = ("正在计算", "安全验证", "验证中", "Checking your browser", "Just a moment")
 # 镜像站挂掉的提示语
 BROKEN_HINTS = ("502 Bad Gateway", "503 Service", "504 Gateway", "Bad Gateway", "服务暂时不可用")
+# 导航站自身「全挂」的提示语（页面标题常为「挂了👻」）
+DEAD_HINTS = ("挂了", "无法访问", "请更换", "部分节点", "节点无法访问", "没有可用", "全部失联")
 # 未登录的提示语
 LOGGED_OUT_HINTS = ("立即登录", "请先登录", "登录后")
 # 登录按钮候选
@@ -77,11 +79,17 @@ class BTRpaFlow:
         # 1. 打开导航站，收集镜像
         self._goto(page, self._nav_url)
         time.sleep(2)
+        self._wait_for_body(page)  # SPA 首屏常是空壳，等正文渲染
         self._dismiss_overlays(page)
+        body0 = self._body(page)
+        if any(h in body0 for h in DEAD_HINTS):
+            result["message"] = "导航站当前所有镜像不可达（页面显示「挂了/请更换」），稍后再试"
+            note(result["message"])
+            return result
         mirrors = self._collect_mirrors(page)
         result["mirrors"] = len(mirrors)
         if not mirrors:
-            result["message"] = "导航站没有解析出任何可用镜像"
+            result["message"] = "导航站没有解析出任何可用镜像（SPA 可能未渲染或页面结构变化）"
             note(result["message"])
             return result
         note(f"发现 {len(mirrors)} 个镜像: " + ", ".join(m["name"] or m["href"] for m in mirrors[: self._max_sites]))
@@ -213,6 +221,13 @@ class BTRpaFlow:
         if not body or not body.strip():
             return True
         return any(h in body for h in BROKEN_HINTS)
+
+    def _wait_for_body(self, page, rounds: int = 25):
+        """SPA 首屏常返回空壳，轮询等待正文渲染出来再解析。"""
+        for _ in range(max(1, rounds)):
+            if (self._body(page) or "").strip():
+                return
+            time.sleep(1)
 
     def _tag_element(self, page, selector_js: str, attr: str) -> bool:
         """用 JS 在页面上找元素并打标，再用稳定的属性选择器去点/填。"""
