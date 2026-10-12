@@ -2,8 +2,11 @@
 """
 GYing 磁力导航搜索下载 (GYingBTMagnet) —— MoviePilot V2 插件
 
-把「导航站 → 镜像站遍历 → 登录 → 搜索 → 按做种数优选 → 取磁力 → 落下载器」
-这条链子搬进 MoviePilot：
+把「导航站 → 镜像站遍历 → 登录 → 搜索 → 取磁力 → 落下载器」
+这条链子搬进 MoviePilot，做成**两步式**交互：
+
+* 第一步「搜索」：`/bt 兰香如故` / 智能体说「磁力搜索 兰香如故」——只返回编号候选列表，**绝不下载**；
+* 第二步「下载」：`/bt 下载第3个` / 智能体说「下载第3个」——只对指定编号的磁力落下载器。
 
 * 浏览器部分用 MP 自带的 CloakBrowser（`app.helper.browser.PlaywrightHelper.action`），
   不再自己带 playwright 依赖；
@@ -11,9 +14,9 @@ GYing 磁力导航搜索下载 (GYingBTMagnet) —— MoviePilot V2 插件
   不再手搓 qB WebUI API。
 
 入口：
-* 远程命令  /bt 片名
-* 插件 API  GET /api/v1/plugin/GYingBTMagnet/search?query=片名&add=true
-* 智能体工具 bt_magnet_search
+* 远程命令  /bt 片名 | /bt 下载第N个
+* 插件 API  GET /api/v1/plugin/GYingBTMagnet/search?query=片名（只搜）| /download?index=N（下载）
+* 智能体工具 bt_magnet_search / bt_magnet_download
 """
 
 import threading
@@ -36,7 +39,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -100,36 +103,34 @@ class GYingBTMagnet(_PluginBase):
             {
                 "cmd": "/bt",
                 "event": EventType.PluginAction,
-                "desc": "磁力搜索下载（加「只搜/先别下载/不下」只搜不下载）",
+                "desc": "磁力搜索/下载：/bt 片名 只返回候选列表不下；/bt 下载第3个 才下载",
                 "category": "媒体搜索",
                 "data": {"action": "gyingbtmagnet_search"},
             }
         ]
 
-    # 识别「只搜不下」意图的关键词：命中则不提交下载器
-    NO_ADD_KEYWORDS = (
-        "先别下载", "先不要下载", "不要下载", "不下载", "别下载", "暂不下载",
-        "只搜", "只搜索", "只搜不下", "只查", "先看看", "看看有哪些", "不下",
-        "先搜一下", "先搜", "不落盘", "不加下载", "不提交",
-    )
+    # 编号下载指令识别：/bt 下载第3个 / 下载3 / 下第3个
+    DOWNLOAD_RE = None  # 延迟编译，避免模块导入期 locale 问题
 
     @classmethod
-    def parse_query(cls, arg_str: str) -> Tuple[str, bool]:
+    def parse_arg(cls, arg_str: str) -> Dict[str, Any]:
         """
-        把 /bt 的参数拆成 (片名, 是否提交下载)。
+        把 /bt 的参数拆成两种意图：
+          - 下载：命中「下载第N个 / 下载N / 下第N个」→ {'mode':'download','index':N}
+          - 搜索：其余全部当片名 → {'mode':'search','query': 片名}
+        """
+        import re
 
-        命中 NO_ADD_KEYWORDS 中任意片段就只搜不下载；
-        同时把这些标记词从片名里剥掉，避免污染搜索词。
-        """
         raw = (arg_str or "").strip()
-        add = True
-        query = raw
-        for kw in cls.NO_ADD_KEYWORDS:
-            if kw in query:
-                add = False
-                query = query.replace(kw, "")
-        query = query.strip(" ，,。.、")
-        return query, add
+        if not raw:
+            return {"mode": "help"}
+        m = re.search(r"下载\s*第?\s*(\d+)\s*个?|下载\s*(\d+)|下\s*第?\s*(\d+)\s*个?", raw)
+        if m:
+            num = m.group(1) or m.group(2) or m.group(3)
+            return {"mode": "download", "index": int(num)}
+        # 剥掉「搜索/搜/找/查」等前缀词，避免污染搜索词
+        query = re.sub(r"^(磁力\s*)?(搜索|搜|找|查|bt|BT)\s*[:：]?", "", raw).strip(" ，,。.、")
+        return {"mode": "search", "query": query}
 
     @eventmanager.register(EventType.PluginAction)
     def command_handler(self, event: Event):
@@ -143,22 +144,32 @@ class GYingBTMagnet(_PluginBase):
         source = event_data.get("source")
         userid = event_data.get("user")
         arg_str = (event_data.get("arg_str") or "").strip()
+        parsed = self.parse_arg(arg_str)
 
-        if not arg_str:
+        if parsed["mode"] == "help":
             self.post_message(
                 channel=channel,
                 title="【磁力搜索】",
-                text="用法：/bt 片名\n例如：/bt 盗梦空间\n想只看候选不下载：/bt 兰香如故 先别下载",
+                text="用法：\n/bt 片名 —— 搜索并返回候选列表（不下载）\n/bt 下载第3个 —— 下载列表中第 3 个磁力",
                 userid=userid,
             )
             return
 
-        query, add = self.parse_query(arg_str)
+        if parsed["mode"] == "download":
+            threading.Thread(
+                target=self._download_and_notify,
+                args=(parsed["index"], channel, userid),
+                daemon=True,
+            ).start()
+            return
+
+        # 搜索模式
+        query = parsed["query"]
         if not query:
             self.post_message(
                 channel=channel,
                 title="【磁力搜索】",
-                text="没识别到片名。用法：/bt 片名（例如 /bt 兰香如故 先别下载）",
+                text="没识别到片名。用法：/bt 片名（例如 /bt 兰香如故）",
                 userid=userid,
             )
             return
@@ -166,13 +177,13 @@ class GYingBTMagnet(_PluginBase):
         # 浏览器流程可能要跑一两分钟，扔到后台线程，别占着事件消费线程
         threading.Thread(
             target=self._search_and_notify,
-            args=(query, channel, userid, add),
+            args=(query, channel, userid),
             daemon=True,
         ).start()
 
-    def _search_and_notify(self, query: str, channel, userid, add: bool = None):
+    def _search_and_notify(self, query: str, channel, userid):
         try:
-            rpa, download = self.run_search(query, add)
+            result = self.run_search_list(query)
         except Exception as err:
             logger.error(f"[GYingBTMagnet] 搜索异常：{err}")
             self.post_message(
@@ -185,36 +196,76 @@ class GYingBTMagnet(_PluginBase):
         self.post_message(
             channel=channel,
             title=f"【磁力搜索】{query}",
-            text=self.format_report(query, rpa, download, add=add),
+            text=self.format_list(query, result),
+            userid=userid,
+        )
+
+    def _download_and_notify(self, index: int, channel, userid):
+        try:
+            result = self.download_by_index(index)
+        except Exception as err:
+            logger.error(f"[GYingBTMagnet] 下载异常：{err}")
+            self.post_message(
+                channel=channel,
+                title="【磁力下载】",
+                text=f"下载出错：{err}",
+                userid=userid,
+            )
+            return
+        self.post_message(
+            channel=channel,
+            title=f"【磁力下载】第{index}个",
+            text=self.format_download(result),
             userid=userid,
         )
 
     # ------------------------------------------------------------ 核心能力
-    def run_search(
-        self, query: str, add: Optional[bool] = None
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def run_search_list(self, query: str) -> Dict[str, Any]:
         """
-        搜索 → 取磁力 → 落下载器。
+        搜索 → 收集候选列表（不取磁力、不下载），存进插件 data 供「下载第N个」复用。
 
         :param query: 搜索关键词
-        :param add: 是否提交下载；None 表示用插件配置里的开关
-        :return: (RPA 结果, 下载结果)
+        :return: {success, candidates:[{idx,href,site,seeds,text}], count, message, trace, elapsed}
         """
-        rpa = self.fetch_magnet(query)
-        if not rpa.get("success"):
-            return rpa, {"success": False, "message": "未取到磁力，未提交下载"}
+        started = time.time()
+        result = self.fetch_list(query)
+        elapsed = round(time.time() - started, 1)
+        result["elapsed"] = elapsed
+        if result.get("success"):
+            candidates = result.get("candidates") or []
+            # 按做种数降序编号，存入插件 data，供下载步骤按 index 取用
+            for i, c in enumerate(candidates, 1):
+                c["idx"] = i
+            self.save_data("last_list", candidates)
+            self.save_data("last_query", query)
+            self.save_data("last_time", time.strftime("%Y-%m-%d %H:%M:%S"))
+        return result
 
-        should_add = self._add_directly if add is None else bool(add)
-        download = (
-            self.add_to_downloader(rpa["magnet"])
-            if should_add
-            else {"success": False, "message": "未提交下载（仅搜索）"}
+    def download_by_index(self, index: int) -> Dict[str, Any]:
+        """按列表编号下载对应磁力。"""
+        candidates = self.get_data("last_list") or []
+        if not candidates:
+            return {"success": False, "message": "还没有可下载的列表，请先 /bt 片名 搜索"}
+        if index < 1 or index > len(candidates):
+            return {
+                "success": False,
+                "message": f"编号超出范围（列表共 {len(candidates)} 个），用 /bt 下载第N个 重选",
+            }
+        cand = candidates[index - 1]
+        magnet = self.fetch_single_magnet(cand.get("site"), cand.get("href"))
+        if not magnet:
+            return {"success": False, "message": "取磁力失败（详情页没解析到磁力链接）", "candidate": cand}
+        download = self.add_to_downloader(magnet)
+        self._record_history(
+            self.get_data("last_query") or cand.get("text", ""),
+            {"title": cand.get("text"), "seeds": cand.get("seeds"), "site": cand.get("site")},
+            download,
         )
-        self._record_history(query, rpa, download)
-        return rpa, download
+        return {"success": download.get("success"), "magnet": magnet, "candidate": cand,
+                "download": download, "message": download.get("message")}
 
-    def fetch_magnet(self, query: str) -> Dict[str, Any]:
-        """用 MP 的 CloakBrowser 跑一遍导航站流程。"""
+    def fetch_list(self, query: str) -> Dict[str, Any]:
+        """用 MP 的 CloakBrowser 跑一遍导航站流程，只收集候选列表。"""
         from app.helper.browser import PlaywrightHelper
 
         flow = BTRpaFlow(
@@ -228,14 +279,10 @@ class GYingBTMagnet(_PluginBase):
         holder: Dict[str, Any] = {}
 
         def _callback(page):
-            holder.update(flow.run(page, query))
+            holder.update(flow.run_collect(page, query))
             return True
 
-        started = time.time()
         try:
-            # 这里刻意用 about:blank：PlaywrightHelper.action 内部会对传入 url 做
-            # networkidle 等待，导航站是 SPA + 持续请求，容易等超时并把 callback 直接跳过。
-            # 先把空白页跑通，真正的导航交给 flow 自己控制。
             PlaywrightHelper().action(
                 url="about:blank",
                 callback=_callback,
@@ -245,16 +292,45 @@ class GYingBTMagnet(_PluginBase):
         except Exception as err:
             logger.error(f"[GYingBTMagnet] 浏览器流程异常：{err}")
 
-        if not holder:
-            return {
-                "success": False,
-                "magnet": None,
-                "message": "浏览器流程没有返回结果（CloakBrowser 可能未就绪，检查 MoviePilot 日志）",
-                "trace": [],
-                "elapsed": round(time.time() - started, 1),
-            }
-        holder["elapsed"] = round(time.time() - started, 1)
+        if not holder or not holder.get("candidates"):
+            holder.setdefault("success", False)
+            holder.setdefault("candidates", [])
+            holder.setdefault(
+                "message",
+                holder.get("message") or "没有搜到可用磁力（导航站/镜像可能临时不可用或需登录）",
+            )
+        else:
+            holder["success"] = True
         return holder
+
+    def fetch_single_magnet(self, site: str, href: str) -> Optional[str]:
+        """针对已确定的详情页链接，单独开一次浏览器取磁力。"""
+        from app.helper.browser import PlaywrightHelper
+
+        flow = BTRpaFlow(
+            nav_url=self._nav_url,
+            username=self._username,
+            password=self._password,
+            min_seeds=self._min_seeds,
+            max_sites=self._max_sites,
+            page_timeout=self._timeout,
+        )
+        holder: Dict[str, Any] = {"magnet": None}
+
+        def _callback(page):
+            holder["magnet"] = flow.fetch_magnet(page, site or "", href or "")
+            return True
+
+        try:
+            PlaywrightHelper().action(
+                url="about:blank",
+                callback=_callback,
+                headless=True,
+                timeout=self._timeout,
+            )
+        except Exception as err:
+            logger.error(f"[GYingBTMagnet] 取磁力浏览器流程异常：{err}")
+        return holder.get("magnet")
 
     def add_to_downloader(self, magnet: str) -> Dict[str, Any]:
         """通过 MoviePilot 的下载器帮助类提交任务。"""
@@ -299,30 +375,41 @@ class GYingBTMagnet(_PluginBase):
 
     # ------------------------------------------------------------ 结果整理
     @staticmethod
-    def format_report(query: str, rpa: Dict[str, Any], download: Dict[str, Any],
-                      add: bool = True) -> str:
+    def format_list(query: str, result: Dict[str, Any]) -> str:
         lines: List[str] = []
-        if rpa.get("success"):
-            lines.append(f"✅ 命中：{rpa.get('title') or query}")
-            lines.append(f"🧲 做种数：{rpa.get('seeds')}")
-            lines.append(f"🌐 来源：{rpa.get('site')}")
-            lines.append(f"⏱ 耗时：{rpa.get('elapsed', '-')}s")
-            if download.get("success"):
-                lines.append(f"⬇️ {download.get('message')}（{download.get('downloader')}）")
-                lines.append(f"磁力：{rpa.get('magnet')}")
-            else:
-                # 未提交下载：可能是「只搜不下」，也可能是落盘失败
-                if not add:
-                    lines.append("👀 仅查看候选，未提交下载（按你的要求）")
-                else:
-                    lines.append(f"⚠️ {download.get('message')}")
-                lines.append(f"磁力：{rpa.get('magnet')}")
-        else:
-            lines.append(f"❌ 没有搜到可用磁力：{rpa.get('message')}")
-            trace = rpa.get("trace") or []
+        candidates = result.get("candidates") or []
+        if not result.get("success") or not candidates:
+            lines.append(f"❌ {query}：没有搜到可用磁力")
+            lines.append(f"   原因：{result.get('message') or '未知'}")
+            trace = result.get("trace") or []
             if trace:
                 lines.append("— 过程 —")
-                lines.extend(trace[-8:])
+                lines.extend(trace[-6:])
+            return "\n".join(lines)
+
+        lines.append(f"🔍 {query}　共 {len(candidates)} 个候选（⚠️ 尚未下载）")
+        for c in candidates:
+            seeds = c.get("seeds")
+            seed_txt = f"做种 {seeds}" if isinstance(seeds, int) and seeds >= 0 else "做种 -"
+            lines.append(f"{c.get('idx')}. {c.get('text') or '(无标题)'} ｜ {seed_txt} ｜ {c.get('site') or ''}")
+        lines.append("")
+        lines.append("回复「下载第3个」（或 /bt 下载第3个）即可下载对应磁力；列表保留到下一次搜索前。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_download(result: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        if not result.get("success"):
+            lines.append(f"❌ {result.get('message')}")
+            cand = result.get("candidate") or {}
+            if cand:
+                lines.append(f"   目标：第{cand.get('idx')}个 {cand.get('text')}")
+            return "\n".join(lines)
+        cand = result.get("candidate") or {}
+        dl = result.get("download") or {}
+        lines.append(f"⬇️ 已对第{cand.get('idx')}个提交下载：{cand.get('text')}")
+        lines.append(f"   做种 {cand.get('seeds')} ｜ {dl.get('downloader')} ｜ {dl.get('message')}")
+        lines.append(f"   磁力：{result.get('magnet')}")
         return "\n".join(lines)
 
     def _record_history(self, query: str, rpa: Dict[str, Any], download: Dict[str, Any]):
@@ -353,9 +440,17 @@ class GYingBTMagnet(_PluginBase):
                 "endpoint": self.api_search,
                 "methods": ["GET"],
                 "auth": "apikey",
-                "summary": "磁力搜索",
-                "description": "从导航站搜索磁力并按做种数优选，可顺带提交到下载器。",
-            }
+                "summary": "磁力搜索（只返回候选列表，不下载）",
+                "description": "从导航站搜索磁力，返回按做种数降序的候选列表，不提交下载器。",
+            },
+            {
+                "path": "/download",
+                "endpoint": self.api_download,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "按编号下载候选",
+                "description": "下载最近一次搜索结果中第 N 个候选的磁力，N 由 index 参数指定。",
+            },
         ]
 
     def api_search(self, query: str, add: bool = False) -> Dict[str, Any]:
@@ -363,12 +458,18 @@ class GYingBTMagnet(_PluginBase):
             return {"success": False, "message": "插件未启用"}
         if not query:
             return {"success": False, "message": "缺少 query 参数"}
-        rpa = self.fetch_magnet(query)
-        if not rpa.get("success") or not add:
-            return {"success": bool(rpa.get("success")), "data": rpa}
-        download = self.add_to_downloader(rpa["magnet"])
-        self._record_history(query, rpa, download)
-        return {"success": True, "data": rpa, "download": download}
+        result = self.run_search_list(query)
+        return {
+            "success": result.get("success"),
+            "count": len(result.get("candidates") or []),
+            "candidates": result.get("candidates") or [],
+            "message": result.get("message"),
+        }
+
+    def api_download(self, index: int = 1) -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        return self.download_by_index(int(index or 1))
 
     # ------------------------------------------------------------ 智能体工具
     def get_agent_tools(self) -> List[Any]:

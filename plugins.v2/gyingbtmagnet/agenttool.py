@@ -2,8 +2,11 @@
 """
 GYingBTMagnet 的智能体工具
 
-让 MoviePilot 的 AI 助手可以直接调用。用户随口说「磁力搜索 盗梦空间」
-「BT 找一下 沙丘 2」「搜个磁力」都能命中本工具。
+两步式交互，让 MoviePilot 的 AI 助手可以直接调用：
+  1) bt_magnet_search  —— 说「磁力搜索 兰香如故」只返回候选列表，不下载；
+  2) bt_magnet_download —— 说「下载第3个」只对列表第 3 个落下载器。
+
+用户随口说「磁力搜索 盗梦空间」「BT找一下 沙丘2」「搜个磁力」「找 BT」都命中搜索工具。
 """
 
 from typing import List, Optional, Type
@@ -15,71 +18,85 @@ from app.core.plugin import PluginManager
 
 
 class GYingBTMagnetSearchInput(BaseModel):
-    """工具入参模型。"""
+    """搜索工具入参模型。"""
 
     query: str = Field(
         ...,
         description=(
-            "要搜索的影片名或资源关键词，例如：盗梦空间、沙丘2、甄嬛传 S01、进击的巨人。"
+            "要搜索的影片名或资源关键词，例如：盗梦空间、沙丘2、甄嬛传 S01、进击的巨人、兰香如故。"
             "只传片名/关键词本身，不要带「磁力」「BT」「找一下」「下载」这类词。"
-        ),
-    )
-    add: bool = Field(
-        True,
-        description=(
-            "是否把选出的磁力直接提交到下载器，默认 true。"
-            "用户说「先看看」「只搜不下载」「有哪些资源」「先别下载」「看看有哪些」时传 false。"
-            "注意：工具内部会自动识别 query 里的这些标记词并强制只搜不下，"
-            "正常调用时保持默认 true 即可，无需手动处理。"
         ),
     )
 
 
 class GYingBTMagnetSearchTool(MoviePilotTool):
-    """从 BT 导航站搜索磁力并下载的工具。"""
+    """从 BT 导航站搜索磁力候选列表（只搜不下）的工具。"""
 
     name: str = "bt_magnet_search"
     description: str = (
-        "【磁力搜索 / BT 找片子】从已配置的 BT 导航站聚合搜索影视资源，"
-        "按做种数优选后把磁力提交给 MoviePilot 的下载器。"
-        "只要用户的意图是「用磁力/BT 找片」或「下载磁力资源」就调用本工具，"
-        "这类说法包括但不限于：磁力搜索、磁力找一下、磁力下载、磁力搜、搜磁力、找磁力、"
-        "BT 搜索、BT 找一下、BT 下载、BT 搜、找 BT、搜个磁力、下个磁力。"
-        "内置索引站（PT 站）搜不到、或者用户明确要磁力/种子时也要用它兜底。"
-        "调用时把影片名原样放进 query，例如用户说「磁力搜索 盗梦空间」→ query='盗梦空间'。"
+        "【磁力搜索 / BT 找片子（只返回候选列表，不下载）】从已配置的 BT 导航站聚合搜索影视资源，"
+        "返回按做种数排序的候选列表，并等待用户挑选。默认绝不下载任何内容。"
+        "只要用户的意图是「用磁力/BT 找片」「看看有什么资源」就调用本工具，"
+        "这类说法包括但不限于：磁力搜索、磁力找一下、磁力搜、搜磁力、找磁力、"
+        "BT搜索、BT找一下、BT搜、找BT、搜个磁力、下个磁力。"
+        "注意：本工具只搜不下载，用户如果要下载会再发「下载第N个」触发 bt_magnet_download。"
+        "调用时把影片名原样放进 query，例如用户说「磁力搜索 兰香如故」→ query='兰香如故'。"
     )
     args_schema: Type[BaseModel] = GYingBTMagnetSearchInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         query = kwargs.get("query", "")
-        return f"磁力搜索中：{query}"
+        return f"磁力搜索中（仅列表，不下载）：{query}"
 
-    # 与插件命令解析共用同一套「只搜不下」关键词，保证 /bt 和智能体工具行为一致
-    NO_ADD_KEYWORDS = (
-        "先别下载", "先不要下载", "不要下载", "不下载", "别下载", "暂不下载",
-        "只搜", "只搜索", "只搜不下", "只查", "先看看", "看看有哪些", "不下",
-        "先搜一下", "先搜", "不落盘", "不加下载", "不提交",
-    )
-
-    async def run(self, query: str, add: bool = True, **kwargs) -> str:
+    async def run(self, query: str, **kwargs) -> str:
         plugin = PluginManager().running_plugins.get("GYingBTMagnet")
         if not plugin:
             return "磁力搜索插件未运行，请先在 MoviePilot 插件页启用「GYing 磁力导航搜索下载」。"
         if not plugin.get_state():
             return "磁力搜索插件未启用，请到插件页打开开关并保存。"
 
-        # 自然语言兜底：query 里带「只搜/先别下载」等标记时强制只搜不下载，
-        # 不依赖上层是否把 add 置为 False。同时把标记词从搜索词里剥掉。
-        cleaned = query or ""
-        for kw in self.NO_ADD_KEYWORDS:
-            if kw in cleaned:
-                add = False
-                cleaned = cleaned.replace(kw, "")
-        cleaned = cleaned.strip(" ，,。.、")
+        result = await self.run_blocking("web", plugin.run_search_list, query)
+        return plugin.format_list(query, result)
 
-        rpa, download = await self.run_blocking("web", plugin.run_search, cleaned, add)
-        return plugin.format_report(cleaned, rpa, download, add=add)
+
+class GYingBTMagnetDownloadInput(BaseModel):
+    """下载工具入参模型。"""
+
+    index: int = Field(
+        ...,
+        description="要下载的候选序号（从 1 开始），对应上一次搜索返回的列表编号。例如用户说「下载第3个」→ index=3。",
+    )
+    query: str = Field(
+        "",
+        description="可选：本次要下载的资源关键词，用于汇报上下文；留空则用上一次搜索的片名。",
+    )
+
+
+class GYingBTMagnetDownloadTool(MoviePilotTool):
+    """按搜索列表编号下载对应磁力的工具。"""
+
+    name: str = "bt_magnet_download"
+    description: str = (
+        "【磁力下载（按编号）】下载最近一次磁力搜索结果中指定编号的磁力，只对那一个落下载器。"
+        "用户说「下载第3个」「下第3个」「下载3」时调用本工具，index 填编号数字。"
+        "必须先有过一次 bt_magnet_search 搜索、列表还在时才有效，编号超出范围会报错提示重搜。"
+    )
+    args_schema: Type[BaseModel] = GYingBTMagnetDownloadInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        index = kwargs.get("index", "")
+        return f"准备下载第 {index} 个磁力…"
+
+    async def run(self, index: int, query: str = "", **kwargs) -> str:
+        plugin = PluginManager().running_plugins.get("GYingBTMagnet")
+        if not plugin:
+            return "磁力搜索插件未运行，请先在 MoviePilot 插件页启用「GYing 磁力导航搜索下载」。"
+        if not plugin.get_state():
+            return "磁力搜索插件未启用，请到插件页打开开关并保存。"
+
+        result = await self.run_blocking("web", plugin.download_by_index, int(index))
+        return plugin.format_download(result)
 
 
 def get_tools() -> List[Type[MoviePilotTool]]:
-    return [GYingBTMagnetSearchTool]
+    return [GYingBTMagnetSearchTool, GYingBTMagnetDownloadTool]

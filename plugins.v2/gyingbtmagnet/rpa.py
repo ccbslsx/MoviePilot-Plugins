@@ -53,20 +53,18 @@ class BTRpaFlow:
         self._page_timeout = max(5, int(page_timeout or 30)) * 1000
 
     # ------------------------------------------------------------------ 对外
-    def run(self, page, query: str) -> Dict[str, Any]:
+    def run_collect(self, page, query: str) -> Dict[str, Any]:
         """
-        在已经拿到的 page 上跑完整流程。
+        在已经拿到的 page 上跑完整流程，但**只收集候选列表、不取磁力、不下载**，
+        供「两步式」交互的第一步使用。
 
         :param page: PlaywrightHelper 回调传入的页面对象
         :param query: 搜索关键词
-        :return: 结果字典
+        :return: {success, candidates:[{href,site,seeds,text}], message, trace, mirrors}
         """
         result: Dict[str, Any] = {
             "success": False,
-            "magnet": None,
-            "site": None,
-            "title": "",
-            "seeds": -1,
+            "candidates": [],
             "message": "",
             "trace": [],
             "mirrors": 0,
@@ -88,7 +86,10 @@ class BTRpaFlow:
             return result
         note(f"发现 {len(mirrors)} 个镜像: " + ", ".join(m["name"] or m["href"] for m in mirrors[: self._max_sites]))
 
-        # 2. 逐个镜像尝试
+        collected: List[Dict[str, Any]] = []
+        seen_href: set = set()
+
+        # 2. 逐个镜像尝试，收集候选（不取磁力、不下载）
         for idx, mirror in enumerate(mirrors[: self._max_sites], 1):
             url = mirror["href"]
             note(f"[{idx}/{min(len(mirrors), self._max_sites)}] 尝试 {url}")
@@ -119,36 +120,41 @@ class BTRpaFlow:
                 note("  未解析到种子条目")
                 continue
 
-            # 3. 按做种数优选
-            picked = None
             for cand in candidates:
-                if self._min_seeds <= 0 or cand["seeds"] < 0 or cand["seeds"] >= self._min_seeds:
-                    picked = cand
-                    break
-            if not picked:
-                note(f"  最优条目做种数 {candidates[0]['seeds']} 低于阈值 {self._min_seeds}，换下一个镜像")
-                continue
-            note(f"  选中: seeds={picked['seeds']} {picked['text'][:80]}")
+                href = cand.get("href")
+                if not href or href in seen_href:
+                    continue
+                # min_seeds 过滤（seeds<0 视为未知，保留）
+                if self._min_seeds > 0 and isinstance(cand.get("seeds"), int) \
+                        and cand["seeds"] >= 0 and cand["seeds"] < self._min_seeds:
+                    continue
+                seen_href.add(href)
+                collected.append({
+                    "href": href,
+                    "site": url,
+                    "seeds": cand.get("seeds", -1),
+                    "text": (cand.get("text") or "").strip(),
+                })
+            note(f"  本镜像累计候选 {len(collected)} 个")
 
-            magnet = self._fetch_magnet(page, url, picked["href"])
-            if not magnet:
-                note("  详情页没拿到磁力")
-                continue
+        # 3. 按做种数降序，截取前 20（seeds<0 排末尾）
+        collected.sort(
+            key=lambda c: (c.get("seeds") if isinstance(c.get("seeds"), int) and c["seeds"] >= 0 else -1),
+            reverse=True,
+        )
+        result["candidates"] = collected[:20]
 
-            result.update(
-                success=True,
-                magnet=magnet,
-                site=url,
-                title=picked["text"],
-                seeds=picked["seeds"],
-                message="OK",
-            )
-            note("✓ 取到磁力")
-            return result
-
-        result["message"] = result["message"] or "所有镜像都没能拿到磁力"
-        note(result["message"])
+        if not result["candidates"]:
+            result["message"] = result["message"] or "所有镜像都没能拿到候选列表"
+            note(result["message"])
+        else:
+            result["success"] = True
+            note(f"✓ 共收集 {len(result['candidates'])} 个候选")
         return result
+
+    # 公开包装：针对已确定的详情页链接取磁力（供下载步骤复用浏览器上下文）
+    def fetch_magnet(self, page, mirror: str, href: str) -> Optional[str]:
+        return self._fetch_magnet(page, mirror, href)
 
     # ------------------------------------------------------------ 基础动作
     def _goto(self, page, url: str):
