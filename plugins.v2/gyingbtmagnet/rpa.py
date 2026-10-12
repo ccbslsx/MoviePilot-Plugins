@@ -533,6 +533,24 @@ class BTRpaFlow:
             return None
         time.sleep(2)
 
+        # 【v1.3.4 修复】详情页同样在登录墙后面：
+        # 旧实现在这里直接找磁力，未登录时页面只有「登录后访问受限内容」→ 永远返回 None，
+        # 表现为 /bt 下载第N个 报「取磁力失败」。这里补一次登录并回跳详情页。
+        try:
+            body = self._body(page)
+        except Exception:
+            body = ""
+        if self._need_login(page, body):
+            logger.info("[GYingBTMagnet] 详情页需要登录，先登录再回跳")
+            if not self._login(page):
+                logger.warn("[GYingBTMagnet] 取磁力前登录失败")
+                return None
+            try:
+                self._goto(page, target)
+            except Exception:
+                return None
+            time.sleep(2)
+
         for _ in range(8):
             mags = self._js(
                 page,
