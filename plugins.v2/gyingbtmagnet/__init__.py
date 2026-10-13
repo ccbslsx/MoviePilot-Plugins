@@ -23,11 +23,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.chain.download import DownloadChain
+from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.event import Event, eventmanager
+from app.core.metainfo import MetaInfo
+from app.core.meta import MetaBase
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType
+from app.schemas.types import EventType, MediaType
 
 from .rpa import BTRpaFlow
 
@@ -39,7 +43,7 @@ class GYingBTMagnet(_PluginBase):
     plugin_name = "GYing 磁力导航搜索下载"
     plugin_desc = "从 BT 导航站聚合搜索磁力，按做种数优选后直接交给 MoviePilot 的下载器。"
     plugin_icon = "https://raw.githubusercontent.com/ccbslsx/MoviePilot-Plugins/main/icons/gyingbtmagnet.png"
-    plugin_version = "1.3.5"
+    plugin_version = "1.4.0"
     plugin_author = "ccbslsx"
     author_url = "https://github.com/ccbslsx"
     plugin_config_prefix = "gyingbtmagnet_"
@@ -242,7 +246,14 @@ class GYingBTMagnet(_PluginBase):
         return result
 
     def download_by_index(self, index: int) -> Dict[str, Any]:
-        """按列表编号下载对应磁力。"""
+        """
+        按列表编号下载对应磁力。
+
+        v1.4.0 起：走 MoviePilot 自己的下载链路（DownloadChain.download_single），
+        复用 MP 的「识别媒体 → 计算分类路径 → 落下载器 → 写下载历史 → 触发自动整理」
+        全套机制，文件按 MP 目录配置归类（如 /media/qb/电视剧/国产剧），
+        识别不出的兜底到「未知」分类（/media/qb/未知），不再像以前那样全堆在 /media/qb 根目录。
+        """
         candidates = self.get_data("last_list") or []
         if not candidates:
             return {"success": False, "message": "还没有可下载的列表，请先 /bt 片名 搜索"}
@@ -254,6 +265,8 @@ class GYingBTMagnet(_PluginBase):
         cand = candidates[index - 1]
         self.save_data("run_download_start", f"{time.strftime('%Y-%m-%d %H:%M:%S')} 第{index}个 "
                                            f"{(cand.get('text') or '')[:60]}")
+
+        # 1) 取磁力（复用现有登录+回跳逻辑）
         magnet = self.fetch_single_magnet(cand.get("site"), cand.get("href"))
         if not magnet:
             self.save_data("last_download", {
@@ -264,22 +277,91 @@ class GYingBTMagnet(_PluginBase):
                 "message": "取磁力失败（详情页没解析到磁力链接）",
             })
             return {"success": False, "message": "取磁力失败（详情页没解析到磁力链接）", "candidate": cand}
-        download = self.add_to_downloader(magnet)
+
+        # 2) 交给 MP 标准下载链路做识别+分类+落盘
+        download, classify = self.add_via_mp_chain(magnet, cand.get("text", ""), cand)
+
+        ok = bool(download.get("success"))
         self.save_data("last_download", {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "index": index,
             "title": cand.get("text"),
-            "ok": bool(download.get("success")),
+            "ok": ok,
             "message": download.get("message"),
             "downloader": download.get("downloader"),
+            "category": classify.get("category"),
+            "download_dir": classify.get("download_dir"),
         })
         self._record_history(
             self.get_data("last_query") or cand.get("text", ""),
             {"title": cand.get("text"), "seeds": cand.get("seeds"), "site": cand.get("site")},
             download,
         )
-        return {"success": download.get("success"), "magnet": magnet, "candidate": cand,
-                "download": download, "message": download.get("message")}
+        result = {"success": ok, "magnet": magnet, "candidate": cand,
+                  "download": download, "classify": classify, "message": download.get("message")}
+        return result
+
+    # ----------------------------------------------------------------- 分类下载
+    def add_via_mp_chain(self, magnet: str, title: str, cand: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        用 MoviePilot 自己的下载链路提交磁力，自动完成媒体识别与分类存放。
+
+        :return: (download_result, classify_info)
+            classify_info = {recognized: bool, type: str, category: str, download_dir: str}
+        """
+        # 用整段标题喂给 MP 识别器（季/集信息由 MetaInfo 自动抽取，如「第二季」→ begin_season=2）
+        meta = MetaInfo(title or "")
+        mediainfo = DownloadChain().recognize_media(meta=meta)
+        classify = {"recognized": bool(mediainfo), "type": "", "category": "", "download_dir": ""}
+
+        if not mediainfo:
+            # 识别不出：兜底到「未知」分类，仍按 MP 目录规则存到 /media/qb/未知
+            logger.warn(f"[GYingBTMagnet] 「{title}」无法识别媒体，兜底到未知分类")
+            mediainfo = MediaInfo(type=MediaType.UNKNOWN, title=title)
+
+        classify["type"] = (mediainfo.type.value if mediainfo.type else "") or ""
+        classify["category"] = mediainfo.category or ""
+        classify["download_dir"] = self._preview_download_dir(mediainfo)
+
+        torrent = TorrentInfo(
+            title=title,
+            enclosure=magnet,
+            size=float(cand.get("size") or 0.0),
+            site_name=(cand.get("site") or "").split("/")[-2] if cand.get("site") else None,
+        )
+        context = Context(meta_info=meta, media_info=mediainfo, torrent_info=torrent)
+
+        try:
+            _hash = DownloadChain().download_single(
+                context=context,
+                torrent_content=magnet,
+                downloader=self._downloader or None,
+                label=self._tag or None,
+                source="GYingBTMagnet",
+                username=self.plugin_name,
+            )
+        except Exception as err:
+            logger.error(f"[GYingBTMagnet] 调用 MP 下载链路异常：{err}")
+            return {"success": False, "message": f"MP 下载链路报错：{err}", "downloader": None}, classify
+
+        ok = bool(_hash)
+        dl = {
+            "success": ok,
+            "message": "已提交下载（MP 自动分类）" if ok else "下载器拒绝了这个任务",
+            "downloader": self._downloader or "默认下载器",
+            "hash": _hash,
+        }
+        return dl, classify
+
+    def _preview_download_dir(self, mediainfo) -> str:
+        """仅用于回报用户：按 MP 目录配置算出该媒体的实际落盘目录（不实际落盘）。"""
+        try:
+            storage, download_dir, err = DownloadChain()._resolve_media_download_dir(media_info=mediainfo)
+            if download_dir:
+                return f"{storage}:{download_dir.as_posix()}" if storage and storage != "local" else download_dir.as_posix()
+            return f"（未找到下载目录：{err}）"
+        except Exception as err:
+            return f"（预览目录出错：{err}）"
 
     def fetch_list(self, query: str) -> Dict[str, Any]:
         """用 MP 的 CloakBrowser 跑一遍导航站流程，只收集候选列表。"""
@@ -381,47 +463,6 @@ class GYingBTMagnet(_PluginBase):
         self.save_data("last_download_trace", holder["trace"])
         return holder.get("magnet")
 
-    def add_to_downloader(self, magnet: str) -> Dict[str, Any]:
-        """通过 MoviePilot 的下载器帮助类提交任务。"""
-        helper = DownloaderHelper()
-        service = None
-        try:
-            if self._downloader:
-                service = helper.get_service(name=self._downloader)
-            if not service:
-                services = helper.get_services() or {}
-                service = next(iter(services.values()), None)
-        except Exception as err:
-            return {"success": False, "message": f"读取下载器配置失败：{err}"}
-
-        if not service or not getattr(service, "instance", None):
-            return {"success": False, "message": "没有找到可用的下载器，请先在「设定 → 下载器」里配置"}
-
-        try:
-            ret = service.instance.add_torrent(
-                content=magnet,
-                is_paused=False,
-                download_dir=self._save_path or None,
-                tag=self._tag or None,
-                category=self._category or None,
-            )
-        except Exception as err:
-            logger.error(f"[GYingBTMagnet] 添加下载任务失败：{err}")
-            return {"success": False, "message": f"下载器报错：{err}", "downloader": service.name}
-
-        ok = False
-        if isinstance(ret, (tuple, list)):
-            ok = bool(ret[0]) if ret else False
-        else:
-            ok = bool(ret)
-
-        return {
-            "success": ok,
-            "message": "已提交下载任务" if ok else "下载器拒绝了这个任务",
-            "downloader": service.name,
-            "detail": str(ret)[:200],
-        }
-
     # ------------------------------------------------------------ 结果整理
     @staticmethod
     def format_list(query: str, result: Dict[str, Any]) -> str:
@@ -456,8 +497,15 @@ class GYingBTMagnet(_PluginBase):
             return "\n".join(lines)
         cand = result.get("candidate") or {}
         dl = result.get("download") or {}
+        cls = result.get("classify") or {}
         lines.append(f"⬇️ 已对第{cand.get('idx')}个提交下载：{cand.get('text')}")
         lines.append(f"   做种 {cand.get('seeds')} ｜ {dl.get('downloader')} ｜ {dl.get('message')}")
+        if cls.get("recognized"):
+            cat = cls.get("category") or "未分类"
+            lines.append(f"   分类：{cls.get('type')} / {cat}")
+        else:
+            lines.append(f"   ⚠️ 未识别到媒体，兜底到「未知」分类")
+        lines.append(f"   落盘：{cls.get('download_dir')}")
         lines.append(f"   磁力：{result.get('magnet')}")
         return "\n".join(lines)
 
@@ -629,33 +677,25 @@ class GYingBTMagnet(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "save_path",
-                                            "label": "保存路径（留空用下载器默认）",
+                                            "model": "tag",
+                                            "label": "标签",
+                                            "hint": "保持 MOVIEPILOT 可让自动整理接手",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VTextField",
-                                        "props": {"model": "category", "label": "分类"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
+                                        "component": "VAlert",
                                         "props": {
-                                            "model": "tag",
-                                            "label": "标签",
-                                            "hint": "保持 MOVIEPILOT 可让自动整理接手",
-                                            "persistent-hint": True,
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "下载自动按 MoviePilot 目录规则分类存放（如 /media/qb/电视剧/国产剧），"
+                                                    "识别不出的兜底到「未知」分类，无需手动填保存路径与分类。",
                                         },
                                     }
                                 ],
